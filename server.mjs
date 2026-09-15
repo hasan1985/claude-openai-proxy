@@ -35,8 +35,34 @@ const MODEL_ALIASES = {
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
+// CORS. Must come BEFORE auth: a preflight OPTIONS carries no credentials, so
+// authenticating it would reject every browser request before it starts — and the
+// browser hides the reason, surfacing only "Connection error".
 app.use((req, res, next) => {
-  const token = (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
+  res.set({
+    "Access-Control-Allow-Origin": req.get("origin") || "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    // Echo whatever the preflight asked for rather than keeping a fixed list.
+    // A fixed list looks fine against curl (you only request the headers you
+    // thought of) and then fails in a real browser: the Anthropic SDK also sends
+    // x-stainless-lang, x-stainless-runtime, x-stainless-retry-count, x-stainless-
+    // timeout and friends, and one unlisted header fails the whole preflight.
+    "Access-Control-Allow-Headers":
+      req.get("access-control-request-headers") ||
+      "authorization, content-type, x-api-key, x-conversation-id, " +
+      "anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access",
+    "Access-Control-Max-Age": "86400",
+    Vary: "Origin",
+  });
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
+
+app.use((req, res, next) => {
+  // Bearer is the OpenAI convention; x-api-key is Anthropic's. Accept both, since
+  // this proxy now answers on both shapes.
+  const bearer = (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
+  const token = bearer || req.get("x-api-key") || "";
   if (token !== PROXY_API_KEY) {
     return res.status(401).json({ error: { message: "Invalid API key", type: "invalid_request_error" } });
   }
@@ -220,6 +246,158 @@ app.post("/v1/chat/completions", async (req, res) => {
     } else {
       res.status(500).json({ error: { message, type: "api_error" } });
     }
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────
+//  Anthropic Messages API  (POST /v1/messages)
+//
+//  The OpenAI endpoint above cannot drive a tool-using client: the Agent SDK
+//  runs tools itself, in this process, and has no way to hand a call back to an
+//  HTTP caller and resume later. That is exactly what the tool-use flow needs.
+//
+//  So tool calling here is EMULATED at the prompt level: the tool schemas go
+//  into the system prompt, the model is asked to answer with a marked JSON
+//  block when it wants a tool, and that block is parsed back into a `tool_use`
+//  content block. Ordinary shims do the same thing.
+//
+//  Be clear-eyed about the tradeoff: this depends on the model emitting
+//  well-formed JSON in a specific shape. It is good enough for a demo and it is
+//  not the real thing. A genuine API key skips all of it.
+// ────────────────────────────────────────────────────────────────────────
+
+const TOOL_OPEN = "<tool_call>";
+const TOOL_CLOSE = "</tool_call>";
+
+function toolInstructions(tools = []) {
+  if (!tools.length) return "";
+  const listed = tools
+    .map((t) => `- ${t.name}: ${t.description}\n  input schema: ${JSON.stringify(t.input_schema ?? {})}`)
+    .join("\n");
+  return [
+    "",
+    "You can call tools. The available tools are:",
+    listed,
+    "",
+    `To call one, reply with ONLY this and nothing else:`,
+    `${TOOL_OPEN}{"name": "<tool name>", "input": { ...arguments... }}${TOOL_CLOSE}`,
+    "",
+    "Rules:",
+    "- One tool call per reply. No prose before or after the block.",
+    "- The input must be valid JSON matching that tool's input schema.",
+    "- After a tool result comes back, either call another tool or answer normally.",
+    "- If no tool is needed, just answer normally with no block.",
+  ].join("\n");
+}
+
+/** Flattens Anthropic message blocks — including tool results — into a prompt. */
+function buildAnthropicPrompt(messages = []) {
+  const turns = [];
+  for (const m of messages) {
+    const blocks = typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content || [];
+    const parts = [];
+    for (const b of blocks) {
+      if (b.type === "text") parts.push(b.text);
+      else if (b.type === "tool_use") {
+        parts.push(`${TOOL_OPEN}${JSON.stringify({ name: b.name, input: b.input })}${TOOL_CLOSE}`);
+      } else if (b.type === "tool_result") {
+        const body = typeof b.content === "string"
+          ? b.content
+          : (b.content || []).map((c) => c.text ?? "").join("\n");
+        parts.push(`Tool result${b.is_error ? " (error)" : ""}: ${body}`);
+      }
+    }
+    if (!parts.length) continue;
+    turns.push(`${m.role === "assistant" ? "Assistant" : "Human"}: ${parts.join("\n")}`);
+  }
+  return turns.length > 1 ? `${turns.join("\n\n")}\n\nAssistant:` : turns[0] || "";
+}
+
+/** Pulls a tool call out of the reply, if the model emitted one. */
+function parseToolCall(text) {
+  const start = text.indexOf(TOOL_OPEN);
+  if (start === -1) return null;
+  const end = text.indexOf(TOOL_CLOSE, start);
+  const body = text.slice(start + TOOL_OPEN.length, end === -1 ? undefined : end).trim();
+  try {
+    const parsed = JSON.parse(body);
+    if (!parsed || typeof parsed.name !== "string") return null;
+    return { name: parsed.name, input: parsed.input ?? {} };
+  } catch {
+    return null;   // malformed — fall through and treat the reply as prose
+  }
+}
+
+app.post("/v1/messages", async (req, res) => {
+  const { messages, model, system, tools = [], stream = false } = req.body || {};
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({
+      type: "error",
+      error: { type: "invalid_request_error", message: "`messages` is required" },
+    });
+  }
+  if (stream) {
+    return res.status(400).json({
+      type: "error",
+      error: { type: "invalid_request_error", message: "streaming is not implemented on /v1/messages" },
+    });
+  }
+
+  const resolvedModel = MODEL_ALIASES[model] || model || DEFAULT_MODEL;
+  const systemText = Array.isArray(system)
+    ? system.map((s) => s.text ?? "").join("\n\n")
+    : system || "";
+
+  const abort = new AbortController();
+  res.on("close", () => { if (!res.writableEnded) abort.abort(); });
+
+  const run = query({
+    prompt: buildAnthropicPrompt(messages),
+    options: {
+      model: resolvedModel,
+      systemPrompt: `${systemText}${toolInstructions(tools)}`.trim() || undefined,
+      tools: [],
+      maxTurns: 1,
+      persistSession: false,
+      abortController: abort,
+    },
+  });
+
+  try {
+    let text = "";
+    let usage = null;
+    for await (const msg of run) {
+      if (msg.type === "result") {
+        if (msg.subtype !== "success") throw new Error(msg.result || "Claude Code returned an error");
+        text = msg.result;
+        usage = msg.usage;
+      }
+    }
+
+    const call = tools.length ? parseToolCall(text) : null;
+    const content = call
+      ? [{ type: "tool_use", id: `toolu_${crypto.randomBytes(12).toString("hex")}`, name: call.name, input: call.input }]
+      : [{ type: "text", text }];
+
+    res.json({
+      id: `msg_${crypto.randomBytes(12).toString("hex")}`,
+      type: "message",
+      role: "assistant",
+      model: resolvedModel,
+      content,
+      stop_reason: call ? "tool_use" : "end_turn",
+      stop_sequence: null,
+      usage: {
+        input_tokens: usage?.input_tokens ?? 0,
+        output_tokens: usage?.output_tokens ?? 0,
+      },
+    });
+  } catch (err) {
+    if (abort.signal.aborted) return;
+    res.status(500).json({
+      type: "error",
+      error: { type: "api_error", message: err?.message || String(err) },
+    });
   }
 });
 

@@ -37,9 +37,33 @@ client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="my-secret-key")
 
 ## Endpoints
 
-- `POST /v1/chat/completions` — streaming (SSE) and non-streaming
+- `POST /v1/chat/completions` — OpenAI shape; streaming (SSE) and non-streaming
+- `POST /v1/messages` — **Anthropic Messages shape**, with emulated tool calling
 - `GET /v1/models`
 - `GET /v1/sessions` — session ids recorded this run (when history is on)
+
+Requests are CORS-enabled, so a browser app can call this directly. The preflight
+echoes back whatever `Access-Control-Request-Headers` asks for — a fixed allow-list
+passes curl and then fails in a real browser, because the Anthropic SDK also sends
+`x-stainless-lang`, `x-stainless-retry-count` and friends, and one unlisted header
+fails the whole preflight.
+
+Auth accepts either `Authorization: Bearer <key>` (OpenAI convention) or
+`x-api-key: <key>` (Anthropic's).
+
+## Tool calling on `/v1/messages`
+
+The Agent SDK runs tools itself, in this process — it has no way to hand a call back
+to an HTTP caller and resume on a later request, which is exactly what the tool-use
+flow needs. So tool calling here is **emulated at the prompt level**: the tool
+schemas go into the system prompt, the model is asked to reply with a marked JSON
+block, and that block is parsed back into a `tool_use` content block with
+`stop_reason: "tool_use"`.
+
+It works — verified driving a real WebMCP app through two chained tool calls — but
+be clear-eyed: it depends on the model emitting well-formed JSON in a specific
+shape. Good enough for a demo, not the real thing. A genuine API key skips all of
+it. Streaming is not implemented on this endpoint.
 
 ## History (`PERSIST_SESSIONS=1`)
 
