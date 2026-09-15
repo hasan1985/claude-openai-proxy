@@ -14,6 +14,11 @@ const PERSIST = process.env.PERSIST_SESSIONS === "1";
 // it costs threading, not history (the transcripts are already on disk).
 const sessions = new Map();
 
+// Explicit threading for /v1/messages: client-supplied conversation id ->
+// { sessionId, toolsHash }. The client mints the id; the proxy stays stateless
+// unless it is given one.
+const conversations = new Map();
+
 const fingerprint = (msgs) =>
   crypto
     .createHash("sha256")
@@ -51,6 +56,9 @@ app.use((req, res, next) => {
       req.get("access-control-request-headers") ||
       "authorization, content-type, x-api-key, x-conversation-id, " +
       "anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access",
+    // Custom response headers are invisible to a browser unless listed here.
+    "Access-Control-Expose-Headers":
+      "x-conversation-id, x-claude-session-id, x-conversation-threaded",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
   });
@@ -92,6 +100,10 @@ app.get("/v1/sessions", (_req, res) => {
     persist: PERSIST,
     cwd: process.cwd(),
     sessions: ids,
+    conversations: [...conversations.entries()].map(([id, v]) => ({
+      conversationId: id,
+      sessionId: v.sessionId,
+    })),
     hint: PERSIST
       ? `claude --resume <id>   (run from ${process.cwd()})`
       : "set PERSIST_SESSIONS=1 to record conversations",
@@ -290,28 +302,42 @@ function toolInstructions(tools = []) {
   ].join("\n");
 }
 
-/** Flattens Anthropic message blocks — including tool results — into a prompt. */
+/** Renders one Anthropic message — text, tool_use and tool_result blocks — as text. */
+function renderMessage(m) {
+  const blocks = typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content || [];
+  const parts = [];
+  for (const b of blocks) {
+    if (b.type === "text") parts.push(b.text);
+    else if (b.type === "tool_use") {
+      parts.push(`${TOOL_OPEN}${JSON.stringify({ name: b.name, input: b.input })}${TOOL_CLOSE}`);
+    } else if (b.type === "tool_result") {
+      const body = typeof b.content === "string"
+        ? b.content
+        : (b.content || []).map((c) => c.text ?? "").join("\n");
+      parts.push(`Tool result${b.is_error ? " (error)" : ""}: ${body}`);
+    }
+  }
+  return parts.join("\n");
+}
+
+/** Flattens a whole conversation into one prompt, for unthreaded requests. */
 function buildAnthropicPrompt(messages = []) {
   const turns = [];
   for (const m of messages) {
-    const blocks = typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content || [];
-    const parts = [];
-    for (const b of blocks) {
-      if (b.type === "text") parts.push(b.text);
-      else if (b.type === "tool_use") {
-        parts.push(`${TOOL_OPEN}${JSON.stringify({ name: b.name, input: b.input })}${TOOL_CLOSE}`);
-      } else if (b.type === "tool_result") {
-        const body = typeof b.content === "string"
-          ? b.content
-          : (b.content || []).map((c) => c.text ?? "").join("\n");
-        parts.push(`Tool result${b.is_error ? " (error)" : ""}: ${body}`);
-      }
-    }
-    if (!parts.length) continue;
-    turns.push(`${m.role === "assistant" ? "Assistant" : "Human"}: ${parts.join("\n")}`);
+    const text = renderMessage(m);
+    if (!text) continue;
+    turns.push(`${m.role === "assistant" ? "Assistant" : "Human"}: ${text}`);
   }
   return turns.length > 1 ? `${turns.join("\n\n")}\n\nAssistant:` : turns[0] || "";
 }
+
+/** Identifies the tool set, so a mid-conversation change can be detected. */
+const hashTools = (tools = []) =>
+  crypto
+    .createHash("sha256")
+    .update(JSON.stringify(tools.map((t) => [t.name, t.description, t.input_schema])))
+    .digest("hex")
+    .slice(0, 16);
 
 /** Pulls a tool call out of the reply, if the model emitted one. */
 function parseToolCall(text) {
@@ -348,17 +374,47 @@ app.post("/v1/messages", async (req, res) => {
     ? system.map((s) => s.text ?? "").join("\n\n")
     : system || "";
 
+  // Optional threading. The API stays stateless by default, exactly like the real
+  // one: the client replays its history and nothing is remembered. Send an
+  // X-Conversation-Id and this relays the turn into that Claude session instead,
+  // so only the new message travels and the prompt cache is reused.
+  //
+  // The client mints the id, rather than the proxy returning one, because the
+  // Messages API response has nowhere to put a session id — a stock SDK would
+  // drop it. The id comes back as a response header for visibility.
+  const convId = req.get("x-conversation-id") || null;
+  const prior = convId ? conversations.get(convId) : null;
+  const resumeId = PERSIST ? prior?.sessionId ?? null : null;
+  const toolsHash = hashTools(tools);
+
+  // Tools come and go as the user navigates a WebMCP page, so a resumed session
+  // can hold a stale list. Re-state them in the turn itself when they change —
+  // resetting the system prompt mid-session would not take effect.
+  const toolsChanged = Boolean(resumeId && prior && prior.toolsHash !== toolsHash);
+
+  const prompt = resumeId
+    ? [
+        toolsChanged ? `(The available tools have changed.)${toolInstructions(tools)}` : "",
+        renderMessage(messages[messages.length - 1]),
+      ].filter(Boolean).join("\n\n")
+    : buildAnthropicPrompt(messages);
+
   const abort = new AbortController();
   res.on("close", () => { if (!res.writableEnded) abort.abort(); });
 
   const run = query({
-    prompt: buildAnthropicPrompt(messages),
+    prompt,
     options: {
       model: resolvedModel,
-      systemPrompt: `${systemText}${toolInstructions(tools)}`.trim() || undefined,
+      // On resume the session already carries the system prompt; re-sending it
+      // has no effect, so only set it when starting a session.
+      systemPrompt: resumeId
+        ? undefined
+        : `${systemText}${toolInstructions(tools)}`.trim() || undefined,
       tools: [],
       maxTurns: 1,
-      persistSession: false,
+      persistSession: PERSIST && Boolean(convId),
+      ...(resumeId ? { resume: resumeId } : {}),
       abortController: abort,
     },
   });
@@ -366,13 +422,28 @@ app.post("/v1/messages", async (req, res) => {
   try {
     let text = "";
     let usage = null;
+    let sessionId = null;
     for await (const msg of run) {
       if (msg.type === "result") {
         if (msg.subtype !== "success") throw new Error(msg.result || "Claude Code returned an error");
         text = msg.result;
         usage = msg.usage;
+        sessionId = msg.session_id ?? null;
       }
     }
+
+    if (convId && PERSIST && sessionId) {
+      conversations.set(convId, { sessionId, toolsHash });
+    }
+
+    res.set({
+      "X-Conversation-Threaded": String(Boolean(resumeId)),
+      ...(convId ? { "X-Conversation-Id": convId } : {}),
+      // Only when the session was actually persisted — an unthreaded request gets
+      // a session id from the SDK too, but nothing was written, so reporting it
+      // would imply a `claude --resume` target that does not exist.
+      ...(sessionId && PERSIST && convId ? { "X-Claude-Session-Id": sessionId } : {}),
+    });
 
     const call = tools.length ? parseToolCall(text) : null;
     const content = call

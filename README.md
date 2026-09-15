@@ -51,6 +51,36 @@ fails the whole preflight.
 Auth accepts either `Authorization: Bearer <key>` (OpenAI convention) or
 `x-api-key: <key>` (Anthropic's).
 
+## Sessions on `/v1/messages`
+
+Stateless by default, like the real API: the client replays its history and the
+proxy remembers nothing.
+
+Send an `X-Conversation-Id` and the proxy relays that turn into one long-lived
+Claude session instead — only the new message travels, the prompt cache is reused,
+and the conversation is browsable with `claude --resume`. Requires
+`PERSIST_SESSIONS=1`.
+
+```
+POST /v1/messages          X-Conversation-Id: conv-abc123
+  turn 1  ->  starts a session      X-Conversation-Threaded: false
+  turn 2  ->  resumes it            X-Conversation-Threaded: true
+  new id  ->  new session
+```
+
+The **client** mints the id; the proxy does not return one to adopt. The Messages
+API response has nowhere to carry a session id, so a stock SDK would drop it. The
+id and the underlying Claude session id come back as response headers
+(`X-Conversation-Id`, `X-Claude-Session-Id`, `X-Conversation-Threaded`), exposed
+via CORS so a browser can read them.
+
+`GET /v1/sessions` lists the live conversation -> session mappings.
+
+One wrinkle worth knowing: a resumed session already carries the tool list in its
+system prompt, so the tools are only re-stated when they actually change — which
+they do on a WebMCP page as the user navigates. The proxy hashes the tool set and
+re-injects only on a change.
+
 ## Tool calling on `/v1/messages`
 
 The Agent SDK runs tools itself, in this process — it has no way to hand a call back
