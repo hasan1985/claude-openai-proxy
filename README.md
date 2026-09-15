@@ -51,35 +51,111 @@ fails the whole preflight.
 Auth accepts either `Authorization: Bearer <key>` (OpenAI convention) or
 `x-api-key: <key>` (Anthropic's).
 
-## Sessions on `/v1/messages`
+## Continuous conversations
 
-Stateless by default, like the real API: the client replays its history and the
-proxy remembers nothing.
+Both endpoints are **stateless by default**, like the real APIs: you replay the
+whole `messages` array each turn and the proxy remembers nothing. That works, and
+for a short chat it is fine.
 
-Send an `X-Conversation-Id` and the proxy relays that turn into one long-lived
-Claude session instead — only the new message travels, the prompt cache is reused,
-and the conversation is browsable with `claude --resume`. Requires
-`PERSIST_SESSIONS=1`.
+Threading is the opt-in alternative. The proxy keeps one long-lived Claude session
+per conversation, so each turn sends only the new message. You get prompt-cache
+reuse, no re-flattening of the transcript, and a conversation you can open later
+with `claude --resume`.
+
+Requires `PERSIST_SESSIONS=1`.
+
+### The rule
+
+**Mint one id per chat. Send it on every turn. A new chat means a new id.**
 
 ```
-POST /v1/messages          X-Conversation-Id: conv-abc123
-  turn 1  ->  starts a session      X-Conversation-Threaded: false
-  turn 2  ->  resumes it            X-Conversation-Threaded: true
-  new id  ->  new session
+new chat        →  conv-abc123        (you generate it — a UUID is fine)
+turn 1          →  X-Conversation-Id: conv-abc123    starts a session
+turn 2, 3, …    →  X-Conversation-Id: conv-abc123    resumes it
+user hits "New" →  conv-def456        new id, new session
 ```
 
-The **client** mints the id; the proxy does not return one to adopt. The Messages
-API response has nowhere to carry a session id, so a stock SDK would drop it. The
-id and the underlying Claude session id come back as response headers
-(`X-Conversation-Id`, `X-Claude-Session-Id`, `X-Conversation-Threaded`), exposed
-via CORS so a browser can read them.
+The **client** mints the id; the proxy never hands you one to adopt. The Messages
+API response has nowhere to carry a session id, so a stock SDK would drop it.
 
-`GET /v1/sessions` lists the live conversation -> session mappings.
+### Anthropic SDK (`/v1/messages`)
 
-One wrinkle worth knowing: a resumed session already carries the tool list in its
-system prompt, so the tools are only re-stated when they actually change — which
-they do on a WebMCP page as the user navigates. The proxy hashes the tool set and
-re-injects only on a change.
+```ts
+const conversationId = `conv-${crypto.randomUUID()}`;   // once per chat
+
+const client = new Anthropic({
+  apiKey: "my-secret-key",
+  baseURL: "http://127.0.0.1:8080",
+  defaultHeaders: { "X-Conversation-Id": conversationId },
+  dangerouslyAllowBrowser: true,     // browser only
+});
+
+await client.messages.create({ model: "sonnet", max_tokens: 1024, messages });
+```
+
+Keep appending to `messages` as you normally would. On a resumed turn the proxy
+uses only the last entry and ignores the rest, so replaying costs you nothing and
+keeps your client portable — point `baseURL` at Anthropic and it still works.
+
+### OpenAI SDK (`/v1/chat/completions`)
+
+```python
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="my-secret-key")
+
+client.chat.completions.create(
+    model="sonnet",
+    messages=messages,
+    extra_headers={"X-Conversation-Id": conversation_id},
+)
+```
+
+This endpoint also threads *without* a header, by fingerprinting the history you
+echo back. That needs no client change at all, but it is the fragile path: it
+depends on you replaying assistant replies verbatim, and it breaks the moment you
+edit or summarise history. Prefer the header.
+
+### curl
+
+```bash
+curl -s -H "x-api-key: my-secret-key" -H "content-type: application/json" \
+     -H "X-Conversation-Id: conv-abc123" \
+     -d '{"model":"haiku","max_tokens":200,
+          "messages":[{"role":"user","content":"Remember 42."}]}' \
+     http://127.0.0.1:8080/v1/messages
+```
+
+### Checking that it worked
+
+Three response headers tell you what happened, exposed via CORS so a browser can
+read them too:
+
+| Header | Meaning |
+|---|---|
+| `X-Conversation-Threaded` | `true` if this turn resumed a session. **`false` on the first turn of a conversation — that is correct**, there was nothing to resume yet. |
+| `X-Conversation-Id` | echoed back |
+| `X-Claude-Session-Id` | the Claude session, i.e. your `claude --resume` target. Only present when a session was actually persisted. |
+
+If `X-Conversation-Threaded` stays `false` on turn 2, threading is not happening —
+almost always because `PERSIST_SESSIONS=1` is not set. The request still succeeds,
+so nothing will look broken; you just silently lose the benefit.
+
+`GET /v1/sessions` lists the live conversation → session mappings.
+
+### Things that will catch you out
+
+- **Restarting the proxy drops the mapping.** It is in memory. The next turn on an
+  old id starts a *fresh* session, so the assistant quietly forgets everything —
+  the reply will be coherent, just amnesiac. Old transcripts stay on disk; only the
+  id → session link is lost. Mint a new id after a restart, or keep replaying full
+  history so a lost session costs you nothing.
+- **Threading without `PERSIST_SESSIONS=1` is a silent no-op.** Check the header.
+- **One conversation is one Claude session**, so do not share an id across users or
+  tabs — they will read each other's history.
+- **Tools that change mid-conversation are handled**, but worth knowing about: a
+  resumed session already holds the tool list in its system prompt, and resetting a
+  system prompt mid-session does nothing. The proxy hashes the tool set and
+  re-states it inside the turn only when it changes — which is what a WebMCP page
+  does every time the user navigates.
 
 ## Tool calling on `/v1/messages`
 
@@ -107,13 +183,8 @@ claude --resume <session-id>
 
 Transcripts live in `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`.
 
-Conversations are threaded by fingerprinting the history the client echoes
-back, so a normal OpenAI client needs no changes. For an explicit key, send
-an `X-Conversation-Id` header — more robust, since the fingerprint depends on
-the client replaying assistant replies verbatim.
-
-Threading also means follow-up turns send only the new message rather than
-replaying the transcript, so the prompt cache is reused.
+See [Continuous conversations](#continuous-conversations) for how a client opts
+into threading.
 
 Model aliases: `gpt-4`/`gpt-4o` → opus-5, `gpt-4o-mini`/`gpt-3.5-turbo` → haiku-4.5,
 plus bare `opus`/`sonnet`/`haiku`. Anything else passes through.
