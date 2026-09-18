@@ -7,6 +7,10 @@ Built on the Claude Agent SDK (not stdout-scraping `claude --print`).
 licensed for your own use — not for serving other apps, users, or a hosted demo.
 For anything beyond your own machine, get a real key at console.anthropic.com.
 
+**New here?** Read the [usage guide](./USAGE-GUIDE.md) — is this for me, run it,
+point your client at it, keep a conversation going, and what each error means. This
+README is the reference.
+
 ## Run
 
 ```bash
@@ -17,7 +21,11 @@ PROXY_API_KEY=my-secret-key PORT=8080 npm start
 PROXY_API_KEY=my-secret-key PORT=8080 PERSIST_SESSIONS=1 npm start
 ```
 
-Requires `claude` to be installed and logged in (`claude` → /login).
+Requires `claude` to be installed and logged in (`claude` → /login). If it is not,
+requests still return `200` — the reply text is *"Not logged in · Please run /login"*,
+because the Agent SDK reports that as a successful turn.
+
+The server binds to `127.0.0.1` only; it is not reachable from other machines.
 
 ## Use
 
@@ -187,7 +195,8 @@ See [Continuous conversations](#continuous-conversations) for how a client opts
 into threading.
 
 Model aliases: `gpt-4`/`gpt-4o` → opus-5, `gpt-4o-mini`/`gpt-3.5-turbo` → haiku-4.5,
-plus bare `opus`/`sonnet`/`haiku`. Anything else passes through.
+plus bare `opus`/`sonnet`/`haiku`. Anything else passes through; no model at all uses
+`DEFAULT_MODEL` (env, default `claude-opus-5`).
 
 ## Known limits
 
