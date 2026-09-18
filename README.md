@@ -21,6 +21,9 @@ PROXY_API_KEY=my-secret-key PORT=8080 npm start
 PROXY_API_KEY=my-secret-key PORT=8080 PERSIST_SESSIONS=1 npm start
 ```
 
+If the port is taken the proxy says so and exits with the `kill` command to run;
+an earlier copy still running with an old key is the usual cause.
+
 Requires `claude` to be installed and logged in (`claude` → /login). If it is not,
 requests still return `200` — the reply text is *"Not logged in · Please run /login"*,
 because the Agent SDK reports that as a successful turn.

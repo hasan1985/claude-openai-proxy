@@ -473,7 +473,12 @@ app.post("/v1/messages", async (req, res) => {
 });
 
 // Bind to loopback only — this endpoint fronts your personal Claude login.
-app.listen(PORT, "127.0.0.1", () => {
+const server = app.listen(PORT, "127.0.0.1");
+
+// Announce only once the port is actually bound. A `listen` callback fires before
+// a bind failure is reported, so the old banner printed "listening" and then the
+// process died on an unhandled EADDRINUSE — looking exactly like a clean start.
+server.on("listening", () => {
   console.log(`OpenAI-compatible Claude proxy on http://127.0.0.1:${PORT}/v1`);
   console.log(`API key: ${PROXY_API_KEY}`);
   console.log(
@@ -481,4 +486,16 @@ app.listen(PORT, "127.0.0.1", () => {
       ? `History: ON — browse with \`claude --resume\` from ${process.cwd()}`
       : "History: off (PERSIST_SESSIONS=1 to enable)",
   );
+});
+
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(`Port ${PORT} is already in use — probably an earlier copy of this proxy.`);
+    console.error(`  See it:   lsof -nP -iTCP:${PORT} -sTCP:LISTEN`);
+    console.error(`  Stop it:  kill $(lsof -t -iTCP:${PORT} -sTCP:LISTEN)`);
+    console.error(`  Or pick another port: PORT=8081 npm start`);
+  } else {
+    console.error(`Could not start on port ${PORT}: ${err.message}`);
+  }
+  process.exit(1);
 });

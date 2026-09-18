@@ -42,8 +42,9 @@ npm install
 PROXY_API_KEY=my-secret-key PORT=8080 npm start
 ```
 
-You should see the port and the history mode printed. Leave it running in that
-terminal.
+You should see the port and the history mode printed, and the prompt should **not**
+come back — a proxy that is listening keeps the terminal. If you get the prompt back
+after the banner, read the line above it: usually the port is already taken (§7).
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -205,6 +206,7 @@ Code is underneath.
 | `500` with a message | the SDK threw — usually a model id Claude Code does not recognise | try `sonnet` or a listed id from `/v1/models` |
 | replies are coherent but the assistant forgot the conversation | the proxy restarted and the session map is gone (§5) | new conversation id |
 | a browser request fails but curl works | almost always CORS on a *different* proxy; this one echoes the requested headers | confirm you are on `127.0.0.1` and the port matches |
+| `Port 8080 is already in use` and it exits | an earlier copy is still running — often from days ago, with a different key | `kill $(lsof -t -iTCP:8080 -sTCP:LISTEN)`, or start on another port |
 
 ## 8. What it is, in one paragraph
 
