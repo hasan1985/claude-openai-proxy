@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "test": "node --test tool-call-gate.test.mjs",
+    "test:e2e": "node --test e2e.test.mjs"
   },
   "keywords": [],
   "author": "",

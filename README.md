@@ -49,7 +49,9 @@ client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="my-secret-key")
 ## Endpoints
 
 - `POST /v1/chat/completions` — OpenAI shape; streaming (SSE) and non-streaming
-- `POST /v1/messages` — **Anthropic Messages shape**, with emulated tool calling
+- `POST /v1/messages` — **Anthropic Messages shape**, streaming and non-streaming, with emulated tool calling
+
+Both endpoints stream; the [streaming guide](./STREAMING.md) shows each SDK, the events on the wire, and how a tool call fits in.
 - `GET /v1/models`
 - `GET /v1/sessions` — session ids recorded this run (when history is on)
 
@@ -180,7 +182,25 @@ block, and that block is parsed back into a `tool_use` content block with
 It works — verified driving a real WebMCP app through two chained tool calls — but
 be clear-eyed: it depends on the model emitting well-formed JSON in a specific
 shape. Good enough for a demo, not the real thing. A genuine API key skips all of
-it. Streaming is not implemented on this endpoint.
+it.
+
+A model that emits a *native* tool call for the declared tool instead of the marker
+(Haiku does) is handled too: the call is read from the assistant message before
+Claude Code's single-turn limit turns it into an error.
+
+Streaming on this endpoint is real Messages API SSE. Prose is forwarded as text
+deltas as it arrives; because the reply's type is only known once the marker has or
+has not appeared, `tool-call-gate.mjs` holds back exactly the text that could still
+become the marker and a tool call goes out as one `tool_use` block at the end.
+
+The model runs with none of your own MCP servers loaded (`strictMcpConfig`), so a
+chat turn cannot wander into tools the client never declared.
+
+## Tests
+
+`npm test` runs the gate's unit tests. `npm run test:e2e` spawns the proxy and
+drives every endpoint through your real Claude login — see the
+[usage guide](./USAGE-GUIDE.md#8-testing-it).
 
 ## History (`PERSIST_SESSIONS=1`)
 

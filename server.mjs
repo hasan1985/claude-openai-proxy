@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import express from "express";
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { ToolCallGate, parseToolCall, TOOL_OPEN, TOOL_CLOSE } from "./tool-call-gate.mjs";
 
 const PORT = process.env.PORT || 8080;
 const PROXY_API_KEY = process.env.PROXY_API_KEY || "local-dev-key";
@@ -36,6 +37,11 @@ const MODEL_ALIASES = {
   sonnet: "claude-sonnet-5",
   haiku: "claude-haiku-4-5",
 };
+
+// Claude Code would otherwise load every MCP server from your own settings into
+// each turn. A chat client did not ask for those tools, and a model that calls
+// one runs into the single-turn limit — so the proxy starts every turn bare.
+const NO_MCP = { mcpServers: {}, strictMcpConfig: true };
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -175,6 +181,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       model: resolvedModel,
       systemPrompt,
       tools: [],              // pure chat: no file/bash access
+      ...NO_MCP,
       maxTurns: 1,
       persistSession: PERSIST,
       ...(resumeId ? { resume: resumeId } : {}),
@@ -276,10 +283,12 @@ app.post("/v1/chat/completions", async (req, res) => {
 //  Be clear-eyed about the tradeoff: this depends on the model emitting
 //  well-formed JSON in a specific shape. It is good enough for a demo and it is
 //  not the real thing. A genuine API key skips all of it.
+//
+//  Streaming (`stream: true`) speaks the Messages API's SSE events. Prose is
+//  forwarded as text deltas as it arrives; a tool call has to be held until the
+//  reply is complete, because the block type is announced before its content —
+//  `ToolCallGate` decides which is which, token by token.
 // ────────────────────────────────────────────────────────────────────────
-
-const TOOL_OPEN = "<tool_call>";
-const TOOL_CLOSE = "</tool_call>";
 
 function toolInstructions(tools = []) {
   if (!tools.length) return "";
@@ -339,20 +348,6 @@ const hashTools = (tools = []) =>
     .digest("hex")
     .slice(0, 16);
 
-/** Pulls a tool call out of the reply, if the model emitted one. */
-function parseToolCall(text) {
-  const start = text.indexOf(TOOL_OPEN);
-  if (start === -1) return null;
-  const end = text.indexOf(TOOL_CLOSE, start);
-  const body = text.slice(start + TOOL_OPEN.length, end === -1 ? undefined : end).trim();
-  try {
-    const parsed = JSON.parse(body);
-    if (!parsed || typeof parsed.name !== "string") return null;
-    return { name: parsed.name, input: parsed.input ?? {} };
-  } catch {
-    return null;   // malformed — fall through and treat the reply as prose
-  }
-}
 
 app.post("/v1/messages", async (req, res) => {
   const { messages, model, system, tools = [], stream = false } = req.body || {};
@@ -362,13 +357,6 @@ app.post("/v1/messages", async (req, res) => {
       error: { type: "invalid_request_error", message: "`messages` is required" },
     });
   }
-  if (stream) {
-    return res.status(400).json({
-      type: "error",
-      error: { type: "invalid_request_error", message: "streaming is not implemented on /v1/messages" },
-    });
-  }
-
   const resolvedModel = MODEL_ALIASES[model] || model || DEFAULT_MODEL;
   const systemText = Array.isArray(system)
     ? system.map((s) => s.text ?? "").join("\n\n")
@@ -412,23 +400,55 @@ app.post("/v1/messages", async (req, res) => {
         ? undefined
         : `${systemText}${toolInstructions(tools)}`.trim() || undefined,
       tools: [],
+      ...NO_MCP,
       maxTurns: 1,
       persistSession: PERSIST && Boolean(convId),
       ...(resumeId ? { resume: resumeId } : {}),
+      includePartialMessages: stream,
       abortController: abort,
     },
   });
 
+  const threadingHeaders = {
+    "X-Conversation-Threaded": String(Boolean(resumeId)),
+    ...(convId ? { "X-Conversation-Id": convId } : {}),
+  };
+
+  // Streaming: headers go out now, so the session id (known only at the end)
+  // cannot be reported on this path — `GET /v1/sessions` still has it.
+  const sse = stream ? openMessagesStream(res, { model: resolvedModel, headers: threadingHeaders }) : null;
+  // With no tools declared a `<tool_call>` block is just text, as it is below.
+  const gate = sse && tools.length ? new ToolCallGate() : null;
+
+  // Some models (Haiku, measured) skip the marker and emit a real `tool_use`
+  // block for a declared tool instead. Claude Code has no such tool, so the turn
+  // ends in `error_max_turns` — but the call is right there in the assistant
+  // message, name and input. Take it from there and report it like any other.
+  const declared = new Set(tools.map((t) => t.name));
+  let nativeCall = null;
+
   try {
     let text = "";
+    let streamed = "";
     let usage = null;
     let sessionId = null;
     for await (const msg of run) {
-      if (msg.type === "result") {
-        if (msg.subtype !== "success") throw new Error(msg.result || "Claude Code returned an error");
-        text = msg.result;
+      if (msg.type === "stream_event" && sse) {
+        const ev = msg.event;
+        // text_delta only — thinking_delta is internal reasoning, not the answer.
+        if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
+          streamed += ev.delta.text;
+          sse.text(gate ? gate.push(ev.delta.text) : ev.delta.text);
+        }
+      } else if (msg.type === "assistant") {
+        const use = (msg.message?.content ?? []).find((b) => b.type === "tool_use" && declared.has(b.name));
+        if (use) nativeCall = { name: use.name, input: use.input ?? {} };
+      } else if (msg.type === "result") {
         usage = msg.usage;
         sessionId = msg.session_id ?? null;
+        if (msg.subtype === "error_max_turns" && nativeCall) break; // the iterator throws past this point
+        if (msg.subtype !== "success") throw new Error(msg.result || "Claude Code returned an error");
+        text = msg.result;
       }
     }
 
@@ -436,16 +456,27 @@ app.post("/v1/messages", async (req, res) => {
       conversations.set(convId, { sessionId, toolsHash });
     }
 
+    if (sse) {
+      // Nothing came through as deltas (an SDK build without partial messages):
+      // deliver the finished reply whole, through the same gate.
+      if (!streamed && text) sse.text(gate ? gate.push(text) : text);
+      const tail = gate ? gate.end() : { text: "" };
+      if (tail.text) sse.text(tail.text);
+      const toolCall = nativeCall ?? tail.toolCall ?? null;
+      if (toolCall) sse.toolUse(toolCall);
+      sse.finish(toolCall ? "tool_use" : "end_turn", usage);
+      return;
+    }
+
     res.set({
-      "X-Conversation-Threaded": String(Boolean(resumeId)),
-      ...(convId ? { "X-Conversation-Id": convId } : {}),
+      ...threadingHeaders,
       // Only when the session was actually persisted — an unthreaded request gets
       // a session id from the SDK too, but nothing was written, so reporting it
       // would imply a `claude --resume` target that does not exist.
       ...(sessionId && PERSIST && convId ? { "X-Claude-Session-Id": sessionId } : {}),
     });
 
-    const call = tools.length ? parseToolCall(text) : null;
+    const call = nativeCall ?? (tools.length ? parseToolCall(text) : null);
     const content = call
       ? [{ type: "tool_use", id: `toolu_${crypto.randomBytes(12).toString("hex")}`, name: call.name, input: call.input }]
       : [{ type: "text", text }];
@@ -465,12 +496,84 @@ app.post("/v1/messages", async (req, res) => {
     });
   } catch (err) {
     if (abort.signal.aborted) return;
+    const message = err?.message || String(err);
+    if (sse) return sse.error(message);
     res.status(500).json({
       type: "error",
-      error: { type: "api_error", message: err?.message || String(err) },
+      error: { type: "api_error", message },
     });
   }
 });
+
+/**
+ * Writes Messages API server-sent events. One text block is opened lazily on the
+ * first delta and closed when a tool_use block follows or the message ends; a
+ * tool call goes out as a `tool_use` block whose input arrives as one
+ * `input_json_delta`, which is what the SDK's stream accumulator expects.
+ */
+function openMessagesStream(res, { model, headers }) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    ...headers,
+  });
+  const send = (event) => res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+  const id = `msg_${crypto.randomBytes(12).toString("hex")}`;
+  let index = -1;      // index of the block currently open, -1 when none
+  let open = null;     // its type
+
+  send({
+    type: "message_start",
+    message: {
+      id, type: "message", role: "assistant", model, content: [],
+      stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 },
+    },
+  });
+
+  const close = () => {
+    if (open === null) return;
+    send({ type: "content_block_stop", index });
+    open = null;
+  };
+
+  return {
+    text(delta) {
+      if (!delta) return;
+      if (open !== "text") {
+        close();
+        index += 1;
+        open = "text";
+        send({ type: "content_block_start", index, content_block: { type: "text", text: "" } });
+      }
+      send({ type: "content_block_delta", index, delta: { type: "text_delta", text: delta } });
+    },
+    toolUse({ name, input }) {
+      close();
+      index += 1;
+      open = "tool_use";
+      const toolId = `toolu_${crypto.randomBytes(12).toString("hex")}`;
+      send({ type: "content_block_start", index, content_block: { type: "tool_use", id: toolId, name, input: {} } });
+      send({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } });
+      close();
+    },
+    finish(stopReason, usage) {
+      close();
+      send({
+        type: "message_delta",
+        delta: { stop_reason: stopReason, stop_sequence: null },
+        usage: { input_tokens: usage?.input_tokens ?? 0, output_tokens: usage?.output_tokens ?? 0 },
+      });
+      send({ type: "message_stop" });
+      res.end();
+    },
+    error(message) {
+      close();
+      send({ type: "error", error: { type: "api_error", message } });
+      res.end();
+    },
+  };
+}
 
 // Bind to loopback only — this endpoint fronts your personal Claude login.
 const server = app.listen(PORT, "127.0.0.1");

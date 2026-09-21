@@ -21,7 +21,7 @@ below works unchanged when you point it there instead.
 | Prototype a chat UI in a browser without putting a key in the page | **yes** — CORS is on, the key is one you make up |
 | Use the Anthropic SDK's tool-calling loop against a local model | **yes, with limits** — see §6 |
 | Run something for teammates, a demo URL, or a product | **no** — get an API key |
-| Get streaming on the Anthropic-shaped endpoint | **no** — only the OpenAI endpoint streams |
+| Get streaming on either endpoint | **yes** — SSE in each API's own event format |
 
 ## 2. Before you start
 
@@ -85,7 +85,7 @@ import OpenAI from "openai";
 const client = new OpenAI({ baseURL: "http://127.0.0.1:8080/v1", apiKey: "my-secret-key" });
 ```
 
-Streaming (SSE) and non-streaming both work.
+Streaming (SSE) and non-streaming both work — the [streaming guide](./STREAMING.md) has the details.
 
 ### Anthropic-shaped — `/v1/messages`
 
@@ -106,7 +106,12 @@ const msg = await client.messages.create({
 });
 ```
 
-Not streaming; a `stream: true` request is rejected with 400.
+Streaming works too, in the Messages API's own event format, so
+`client.messages.stream()` and `stream.on("text", …)` behave as they do against
+Anthropic. Prose arrives token by token; a tool call arrives as one `tool_use`
+block at the end of the stream, because the proxy has to see the whole reply
+before it knows the reply *is* a tool call (see §6). The [streaming guide](./STREAMING.md)
+covers both SDKs, the events on the wire, and stopping a stream.
 
 ### curl
 
@@ -189,6 +194,21 @@ Verified driving a real app through chained tool calls — but it depends on the
 producing well-formed JSON in the expected shape, and it will occasionally not. Fine
 for a prototype; a real key gives you the real thing.
 
+Some models skip the marker and emit a native tool call for the declared tool instead
+(Haiku does; Opus follows the instruction). Claude Code has no such tool, so that turn
+would end in a "maximum number of turns" error — the proxy notices the call in the
+model's message and reports it as a `tool_use` anyway. Either way your loop sees the
+same thing.
+
+When streaming, text is forwarded as it arrives, but the marker means the reply's
+*type* is unknown until the reply is complete. The proxy holds back only as much text
+as could still turn into the marker, so prose streams normally and a tool call is
+delivered whole as the last block.
+
+The model also runs with none of your own MCP servers loaded: a chat client did not
+ask for those tools, and a model that called one would hit the same single-turn
+limit.
+
 Not supported anywhere: `n`, `temperature`, `logprobs`, vision, OpenAI-style
 `functions`, and `max_tokens` as a hard output cap. The model runs with **no tools of
 its own** (no filesystem, no bash) — it behaves as a chat model even though Claude
@@ -201,14 +221,26 @@ Code is underneath.
 | `401 Invalid API key` | the key you sent is not `PROXY_API_KEY` — including when you never set it and the default `local-dev-key` applies | send the key you started the proxy with, in either header |
 | `Connection error` from an SDK, nothing else | the proxy is not running, or the port differs, or you are on another machine | `curl http://127.0.0.1:<port>/v1/models` from the same machine |
 | a normal `200` whose reply is **"Not logged in · Please run /login"** | Claude Code has no login. The SDK reports this as a successful turn, so the proxy cannot turn it into an error — it arrives as the assistant's answer | run `claude`, then `/login`; restart the proxy |
-| `400 streaming is not implemented on /v1/messages` | you set `stream: true` on the Anthropic endpoint | drop it, or use `/v1/chat/completions` |
 | `400 \`messages\` is required` | body is not JSON, or the header is missing | send `content-type: application/json` |
 | `500` with a message | the SDK threw — usually a model id Claude Code does not recognise | try `sonnet` or a listed id from `/v1/models` |
 | replies are coherent but the assistant forgot the conversation | the proxy restarted and the session map is gone (§5) | new conversation id |
 | a browser request fails but curl works | almost always CORS on a *different* proxy; this one echoes the requested headers | confirm you are on `127.0.0.1` and the port matches |
 | `Port 8080 is already in use` and it exits | an earlier copy is still running — often from days ago, with a different key | `kill $(lsof -t -iTCP:8080 -sTCP:LISTEN)`, or start on another port |
 
-## 8. What it is, in one paragraph
+## 8. Testing it
+
+```bash
+npm test            # unit: the streaming tool-call gate, no model calls
+npm run test:e2e    # spawns the proxy and drives every endpoint with your login
+```
+
+The end-to-end run takes about a minute and spends a handful of turns on your
+subscription: auth, CORS preflight, both endpoints streaming and not, a chained
+tool call, and threading with `X-Conversation-Id`. Point it at a proxy you already
+have running with `E2E_BASE_URL=http://127.0.0.1:8080 E2E_API_KEY=<its key>`, and
+pick the model with `E2E_MODEL` (default `haiku`, the fastest).
+
+## 9. What it is, in one paragraph
 
 An Express server on `127.0.0.1` that checks a key you chose, accepts either API
 shape, maps model names, and hands each request to the Claude Agent SDK — the same
