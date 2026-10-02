@@ -454,6 +454,18 @@ app.post("/v1/messages", async (req, res) => {
 
     if (convId && PERSIST && sessionId) {
       conversations.set(convId, { sessionId, toolsHash });
+      if (!resumeId) {
+        // Only on the turn that actually created the session — every later turn
+        // of the same conversation resumes it instead, and would just repeat
+        // the same id.
+        //
+        // The ready-to-run command goes on its own line so a triple-click
+        // (select-whole-line, which every terminal supports) grabs a paste-and-go
+        // command — a UUID's hyphens otherwise break double-click word-select in
+        // most terminals, which `console.log` has no way to control.
+        console.log(`[session] new session for conversation ${convId}:`);
+        console.log(`  claude --resume ${sessionId}`);
+      }
     }
 
     if (sse) {
