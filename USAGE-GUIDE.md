@@ -52,6 +52,7 @@ after the banner, read the line above it: usually the port is already taken (§7
 | `PORT` | `8080` | listens on `127.0.0.1:<PORT>` only |
 | `DEFAULT_MODEL` | `claude-opus-5` | used when a request names no model |
 | `PERSIST_SESSIONS` | off | `1` records each conversation as a Claude Code session you can reopen with `claude --resume`, and enables threading (§5) |
+| `EFFORT` | Claude Code's default (`high`) | starting reasoning effort: `low`, `medium`, `high`, `xhigh` or `max`. Changeable while running (see "Effort" below) |
 
 Check it answers:
 
@@ -134,6 +135,64 @@ both endpoints.
 | any full Claude model id | passed through as-is |
 | nothing | `DEFAULT_MODEL` |
 
+`GET /v1/models` lists the models your login can actually use, as full ids.
+
+### Effort
+
+How hard the model thinks before answering: `low`, `medium`, `high`, `xhigh` or
+`max`. Lower is faster and uses less of your plan. There is one server-wide
+setting, and a request can override it for itself.
+
+```bash
+# What is set, and which levels each model takes (Haiku takes none — it ignores effort)
+curl -s -H "x-api-key: my-secret-key" http://127.0.0.1:8080/v1/effort
+
+# Change it for every request that doesn't name its own; {"effort": null} clears it
+curl -s -X PUT -H "x-api-key: my-secret-key" -H "content-type: application/json" \
+  -d '{"effort":"medium"}' http://127.0.0.1:8080/v1/effort
+```
+
+The setting lives in memory: a restart goes back to `EFFORT`. To override it for one
+request, send the field your SDK already has — `reasoning_effort` on
+`/v1/chat/completions` (OpenAI's `minimal` counts as `low`), `output_config.effort`
+on `/v1/messages`. An unknown level is a `400`, not a silent fall back to the default.
+
+Both fields are the real APIs' own — OpenAI's `reasoning_effort`, Anthropic's
+`output_config.effort` — so a client written against either works unchanged. Only
+`GET`/`PUT /v1/effort` are specific to this proxy. The level sets differ between
+vendors: OpenAI's stops at `high`, Claude Code's adds `xhigh` and `max`; the proxy
+takes the union.
+
+#### Choosing a level
+
+Leave it alone unless you have a reason. The default (`high`) is right for most chat
+and coding; effort is a dial you reach for when you notice a problem, not something
+to configure up front.
+
+| The request is | Send | Why |
+|---|---|---|
+| classification, extraction, a short rewrite, autocomplete — anything trivial | `low` | fastest and cheapest on your plan; on a reasoning prompt Sonnet produced 611 output tokens at `low` against 3,012 at `max` |
+| everyday chat, Q&A, routine code | `medium` or nothing | little visible difference from `high` on easy prompts |
+| debugging, multi-step reasoning, anything where a wrong answer costs you time | `high` (the default) | the safe baseline |
+| genuinely hard, and you would rather wait than be wrong | `xhigh` / `max` | noticeably slower — about 50% longer in the test above |
+
+A few rules of thumb:
+
+- **Per request, not server-wide, if more than one thing uses the proxy.** `PUT`
+  changes it for every caller until someone changes it again or the proxy restarts,
+  and nothing tells the other callers. It is the right tool when the proxy serves one
+  app or one person and you want a global knob — "slow day, drop everything to `low`".
+  Otherwise send the field on each request, which also keeps your client portable to
+  the real API.
+- **Pick the model first.** Switching Sonnet → Haiku saves more than any effort
+  setting, and `low` on Opus is often better than `max` on Haiku. Haiku itself takes no
+  effort at all: it accepts the field and ignores it.
+- **It is a cost lever, not a quality one.** Higher effort does not improve a simple
+  answer; it makes a hard answer more likely to be right. To save plan usage, lower
+  it on the high-volume, low-stakes traffic and leave the rest.
+- **Check what is actually set.** `GET /v1/effort` is the source of truth. If answers
+  feel oddly fast or shallow after a restart, that is the first thing to look at.
+
 ### From a browser
 
 CORS is enabled and the preflight echoes back whatever headers the browser asks for,
@@ -170,6 +229,15 @@ transcript you can open later:
 
 ```bash
 claude --resume            # from the proxy's directory; pick from the list
+```
+
+You don't have to pick from the list. On `/v1/messages`, the first turn of each
+conversation prints the exact command in the proxy's terminal. Triple-click the
+second line to copy it:
+
+```
+[session] new session for conversation conv-1234:
+  claude --resume 5ef39841-d85f-4e01-9a57-3c6b667e2e7d
 ```
 
 Check it is working by reading the `X-Conversation-Threaded` response header: `false`
@@ -236,7 +304,8 @@ npm run test:e2e    # spawns the proxy and drives every endpoint with your login
 
 The end-to-end run takes about a minute and spends a handful of turns on your
 subscription: auth, CORS preflight, both endpoints streaming and not, a chained
-tool call, and threading with `X-Conversation-Id`. Point it at a proxy you already
+tool call, threading with `X-Conversation-Id`, and the effort endpoints (which put
+back whatever effort was set before). Point it at a proxy you already
 have running with `E2E_BASE_URL=http://127.0.0.1:8080 E2E_API_KEY=<its key>`, and
 pick the model with `E2E_MODEL` (default `haiku`, the fastest).
 

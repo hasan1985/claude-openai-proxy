@@ -87,6 +87,34 @@ test("GET /v1/models rejects a wrong key with 401 and lists models with the righ
   assert.ok(Array.isArray(body.data) && body.data.length > 0, "models listed");
 });
 
+test("GET/PUT /v1/effort reads, sets, rejects unknown levels, and clears the server-wide effort", async () => {
+  const put = (body) =>
+    fetch(`${baseUrl}/v1/effort`, { method: "PUT", headers: headers(), body: JSON.stringify(body) });
+
+  const initial = await (await fetch(`${baseUrl}/v1/effort`, { headers: headers() })).json();
+  assert.deepEqual(initial.levels, ["low", "medium", "high", "xhigh", "max"]);
+  assert.ok(Array.isArray(initial.models) && initial.models.length > 0, "per-model levels listed");
+
+  try {
+    assert.equal((await (await put({ effort: "medium" })).json()).effort, "medium");
+    assert.equal((await (await put({ effort: "minimal" })).json()).effort, "low", "OpenAI's minimal maps to low");
+    assert.equal((await put({ effort: "turbo" })).status, 400);
+    assert.equal((await put({})).status, 400);
+    const after = await (await fetch(`${baseUrl}/v1/effort`, { headers: headers() })).json();
+    assert.equal(after.effort, "low", "a rejected PUT leaves the setting alone");
+    assert.equal((await (await put({ effort: null })).json()).effort, null);
+  } finally {
+    await put({ effort: initial.effort }); // the proxy may be one the caller started
+  }
+});
+
+test("a request naming an unknown effort level is a 400, on both endpoints", async () => {
+  const chat = await post("/v1/chat/completions", { model: MODEL, reasoning_effort: "turbo", messages: [PONG] });
+  assert.equal(chat.status, 400);
+  const msgs = await post("/v1/messages", { model: MODEL, max_tokens: 20, output_config: { effort: "turbo" }, messages: [PONG] });
+  assert.equal(msgs.status, 400);
+});
+
 test("OPTIONS preflight succeeds without credentials (CORS for browser clients)", async () => {
   const res = await fetch(`${baseUrl}/v1/messages`, {
     method: "OPTIONS",

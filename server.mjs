@@ -11,6 +11,19 @@ const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "claude-opus-5";
 // across requests, so they're browsable with `claude --resume`.
 const PERSIST = process.env.PERSIST_SESSIONS === "1";
 
+// Reasoning effort, as the Agent SDK names its levels. The server-wide value
+// starts from EFFORT and can be changed at runtime with PUT /v1/effort; null
+// leaves the choice to Claude Code (high, unless its own settings say otherwise).
+const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+// OpenAI's reasoning_effort has a level below low; it maps to the lowest we have.
+const EFFORT_ALIASES = { minimal: "low" };
+const normalizeEffort = (v) => (typeof v === "string" ? EFFORT_ALIASES[v] || v : v);
+let effort = normalizeEffort(process.env.EFFORT) || null;
+if (effort && !EFFORT_LEVELS.includes(effort)) {
+  console.error(`EFFORT=${process.env.EFFORT} is not one of: ${EFFORT_LEVELS.join(", ")}`);
+  process.exit(1);
+}
+
 // Maps a conversation fingerprint -> Claude session id. In memory only: losing
 // it costs threading, not history (the transcripts are already on disk).
 const sessions = new Map();
@@ -52,7 +65,7 @@ app.use(express.json({ limit: "10mb" }));
 app.use((req, res, next) => {
   res.set({
     "Access-Control-Allow-Origin": req.get("origin") || "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, OPTIONS",
     // Echo whatever the preflight asked for rather than keeping a fixed list.
     // A fixed list looks fine against curl (you only request the headers you
     // thought of) and then fails in a real browser: the Anthropic SDK also sends
@@ -83,13 +96,97 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/v1/models", (_req, res) => {
-  const ids = ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
+// Served instead of the account's own list if fetching that fails.
+const FALLBACK_MODEL_IDS = ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
+
+// The models this Claude login can actually use, asked of the SDK once at
+// startup. Its rows are aliases ("default", "sonnet", ...) that can resolve to
+// the same model, so they are collapsed to one entry per resolved id — the form
+// clients already send as `model`.
+const accountModels = (async () => {
+  // supportedModels() needs a live session; a prompt that never yields keeps one
+  // open without sending a turn.
+  //
+  // close() ends the SDK's side only: a healthy CLI then exits on stdin EOF (it
+  // does — nothing is left running after a normal fetch). A CLI that is wedged,
+  // the timeout case, outlives this; neither close() nor an abortController kills
+  // the child, and the SDK does not expose its pid. One stray process, once, at
+  // startup — accepted.
+  const q = query({ prompt: (async function* () { await new Promise(() => {}); })(), options: NO_MCP });
+  try {
+    const rows = await Promise.race([
+      q.supportedModels(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timed out after 15s")), 15000).unref()),
+    ]);
+    const byId = new Map();
+    // The "default" row duplicates a real model under a generic name, so let the
+    // model's own row ("Sonnet") supply the label when both are present.
+    for (const m of [...rows].sort((a, b) => (a.value === "default") - (b.value === "default"))) {
+      const id = m.resolvedModel || m.value;
+      if (!byId.has(id)) {
+        byId.set(id, {
+          id,
+          display_name: m.displayName,
+          description: m.description,
+          supported_effort_levels: m.supportsEffort ? m.supportedEffortLevels ?? EFFORT_LEVELS : [],
+        });
+      }
+    }
+    return [...byId.values()];
+  } finally {
+    q.close();
+  }
+})().catch((err) => {
+  console.error(`Could not fetch the account's models, serving a fixed list: ${err.message}`);
+  return FALLBACK_MODEL_IDS.map((id) => ({ id }));
+});
+
+app.get("/v1/models", async (_req, res) => {
+  const models = await accountModels;
   res.json({
     object: "list",
-    data: ids.map((id) => ({ id, object: "model", created: 0, owned_by: "anthropic" })),
+    data: models.map((m) => ({ ...m, object: "model", created: 0, owned_by: "anthropic" })),
   });
 });
+
+const effortState = async () => ({
+  effort,
+  levels: EFFORT_LEVELS,
+  // Per model, which levels it honours; empty when it takes no effort at all
+  // (Haiku), absent when the account's list could not be fetched.
+  models: (await accountModels).map(({ id, supported_effort_levels }) => ({ id, supported_effort_levels })),
+});
+
+app.get("/v1/effort", async (_req, res) => res.json(await effortState()));
+
+// Sets the server-wide effort used by every request that does not name its own.
+// { "effort": null } clears it back to Claude Code's default. In memory only: a
+// restart returns to EFFORT.
+app.put("/v1/effort", async (req, res) => {
+  const body = req.body || {};
+  if (!("effort" in body)) {
+    return res.status(400).json({ error: { message: "`effort` is required (a level, or null to clear)", type: "invalid_request_error" } });
+  }
+  const next = normalizeEffort(body.effort);
+  if (next !== null && !EFFORT_LEVELS.includes(next)) {
+    return res.status(400).json({ error: { message: `\`effort\` must be one of: ${EFFORT_LEVELS.join(", ")}, or null`, type: "invalid_request_error" } });
+  }
+  effort = next;
+  console.log(`[effort] ${effort ?? "default"}`);
+  res.json(await effortState());
+});
+
+// The effort for one request: the client's own field wins over the server-wide
+// setting. Returns { error } for a level we don't know, so a typo is a 400
+// rather than a silent fall back to the default.
+function requestEffort(requested) {
+  if (requested == null) return { effort };
+  const level = normalizeEffort(requested);
+  if (!EFFORT_LEVELS.includes(level)) {
+    return { error: `effort must be one of: ${EFFORT_LEVELS.join(", ")}, minimal` };
+  }
+  return { effort: level };
+}
 
 function textOf(m) {
   return typeof m.content === "string"
@@ -137,9 +234,13 @@ function buildPrompt(messages = []) {
 }
 
 app.post("/v1/chat/completions", async (req, res) => {
-  const { messages, model, stream = false, max_tokens } = req.body || {};
+  const { messages, model, stream = false, max_tokens, reasoning_effort } = req.body || {};
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: { message: "`messages` is required", type: "invalid_request_error" } });
+  }
+  const turnEffort = requestEffort(reasoning_effort);
+  if (turnEffort.error) {
+    return res.status(400).json({ error: { message: `\`reasoning_effort\`: ${turnEffort.error}`, type: "invalid_request_error" } });
   }
 
   const resolvedModel = MODEL_ALIASES[model] || model || DEFAULT_MODEL;
@@ -182,6 +283,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       systemPrompt,
       tools: [],              // pure chat: no file/bash access
       ...NO_MCP,
+      ...(turnEffort.effort ? { effort: turnEffort.effort } : {}),
       maxTurns: 1,
       persistSession: PERSIST,
       ...(resumeId ? { resume: resumeId } : {}),
@@ -350,11 +452,18 @@ const hashTools = (tools = []) =>
 
 
 app.post("/v1/messages", async (req, res) => {
-  const { messages, model, system, tools = [], stream = false } = req.body || {};
+  const { messages, model, system, tools = [], stream = false, output_config } = req.body || {};
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({
       type: "error",
       error: { type: "invalid_request_error", message: "`messages` is required" },
+    });
+  }
+  const turnEffort = requestEffort(output_config?.effort);
+  if (turnEffort.error) {
+    return res.status(400).json({
+      type: "error",
+      error: { type: "invalid_request_error", message: `\`output_config.effort\`: ${turnEffort.error}` },
     });
   }
   const resolvedModel = MODEL_ALIASES[model] || model || DEFAULT_MODEL;
@@ -401,6 +510,7 @@ app.post("/v1/messages", async (req, res) => {
         : `${systemText}${toolInstructions(tools)}`.trim() || undefined,
       tools: [],
       ...NO_MCP,
+      ...(turnEffort.effort ? { effort: turnEffort.effort } : {}),
       maxTurns: 1,
       persistSession: PERSIST && Boolean(convId),
       ...(resumeId ? { resume: resumeId } : {}),
@@ -601,6 +711,7 @@ server.on("listening", () => {
       ? `History: ON — browse with \`claude --resume\` from ${process.cwd()}`
       : "History: off (PERSIST_SESSIONS=1 to enable)",
   );
+  console.log(`Effort: ${effort ?? "default"} (change with PUT /v1/effort)`);
 });
 
 server.on("error", (err) => {

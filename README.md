@@ -52,7 +52,9 @@ client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="my-secret-key")
 - `POST /v1/messages` — **Anthropic Messages shape**, streaming and non-streaming, with emulated tool calling
 
 Both endpoints stream; the [streaming guide](./STREAMING.md) shows each SDK, the events on the wire, and how a tool call fits in.
-- `GET /v1/models`
+- `GET /v1/models` — the models your Claude login can use, fetched from the SDK at startup (a fixed list if that fails)
+- `GET /v1/effort` — the server-wide reasoning effort, the levels, and which levels each model takes
+- `PUT /v1/effort` — `{"effort": "medium"}` sets it (`null` clears); starts from `EFFORT`. A request's own `reasoning_effort` / `output_config.effort` overrides it
 - `GET /v1/sessions` — session ids recorded this run (when history is on)
 
 Requests are CORS-enabled, so a browser app can call this directly. The preflight
@@ -210,6 +212,15 @@ session instead of a series of one-shot calls:
 ```bash
 claude --resume            # pick from a list, run from the repo dir
 claude --resume <session-id>
+```
+
+When a `/v1/messages` conversation (one with an `X-Conversation-Id`) starts a new
+session, the proxy prints the ready-to-run command once, on a line of its own so
+a triple-click selects all of it:
+
+```
+[session] new session for conversation conv-1234:
+  claude --resume 5ef39841-d85f-4e01-9a57-3c6b667e2e7d
 ```
 
 Transcripts live in `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`.
